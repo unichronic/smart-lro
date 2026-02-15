@@ -1,6 +1,6 @@
 # LRO (Lightning Routing Optimizer)
 
-A standalone **experimental developer utility** for routing experiments on top of an existing LND node, now with profile-driven runs and JSONL attempt logging.
+A standalone **experimental developer utility** for routing experiments on top of an existing LND node, now with invoice-aware optimize/send aliases, profile-driven runs, and JSONL attempt logging.
 
 ## Scope
 
@@ -16,14 +16,14 @@ Not included:
 - ❌ Full payment processor behavior
 - ❌ Running a Lightning node
 
-## Phase-by-phase MVP
+## Commands
 
-1. **Phase 1 - LND connectivity**
-   - `lro health`
-2. **Phase 2 - Route collection and scoring**
-   - `lro routes`
-3. **Phase 3 - Optional route execution**
-   - `lro send-route`
+- `health` - check LND connectivity
+- `routes` - query/rerank candidate routes
+- `optimize` - alias of `routes` (invoice-friendly)
+- `send-route` - rerank and attempt payment over selected route
+- `send` - alias of `send-route` (invoice-friendly)
+- `report` - summarize JSONL attempt logs
 
 ## Build
 
@@ -43,47 +43,37 @@ go build ./cmd/lro
   --macaroon ~/.lnd/data/chain/bitcoin/regtest/admin.macaroon
 ```
 
-### 2) Query + rerank routes
+### 2) Optimize routes from invoice (safe)
 
 ```bash
-./lro routes \
+./lro optimize \
   --profile ./profile.json \
-  --dest <33-byte-node-pubkey-hex> \
-  --amt-sat 5000 \
+  --invoice <bolt11> \
   --num-routes 10 \
-  --failure-log .lro-failures.json \
-  --attempt-log .lro-attempts.jsonl
+  --avoid-failures-hours 24 \
+  --attempt-log .lro-attempts.jsonl \
+  --json
 ```
 
-Optional scoring weights:
-- `--w-fee`
-- `--w-fail`
-- `--w-prob`
-
-JSON output mode:
+### 3) Send using optimized path (or dry-run)
 
 ```bash
-./lro routes --dest <pubkeyhex> --amt-sat 5000 --json
-```
-
-### 3) Send via top ranked route
-
-```bash
-./lro send-route \
+./lro send \
   --profile ./profile.json \
-  --dest <pubkeyhex> \
-  --amt-sat 5000 \
-  --payment-hash <32-byte-hash-hex> \
+  --invoice <bolt11> \
   --pick-rank 1 \
   --dry-run \
   --failure-log .lro-failures.json \
   --attempt-log .lro-attempts.jsonl
 ```
 
+### 4) Attempt report
 
-### Profile format (optional)
+```bash
+./lro report --attempt-log .lro-attempts.jsonl --json
+```
 
-You can store repeatable experiment defaults in JSON:
+## Profile format (optional)
 
 ```json
 {
@@ -95,32 +85,34 @@ You can store repeatable experiment defaults in JSON:
   "w_fee": 1.0,
   "w_fail": 4000.0,
   "w_prob": 2000.0,
+  "avoid_failures_hours": 24,
   "failure_log": ".lro-failures.json",
   "attempt_log": ".lro-attempts.jsonl"
 }
 ```
 
-CLI flags still work and can override profile values as needed.
+CLI flags override profile values.
 
 ## Local dev recommendation
 
 Use Polar for regtest experimentation and connect this CLI to one LND node.
 
-
 ## Current status and what's left
 
 Implemented now:
 - ✅ LND connectivity health command.
-- ✅ Route querying + reranking with custom weights.
+- ✅ Invoice-aware optimize/send flow (`--invoice`).
+- ✅ Route querying + reranking with custom weights and recent-failure window.
 - ✅ Optional route execution with rank selection (`--pick-rank`) and safe dry-run mode (`--dry-run`).
 - ✅ Local failure-history tracking to penalize unreliable channels over time.
 - ✅ Structured JSONL attempt logging for route/sending outcomes.
 - ✅ Reproducible profile-driven runs (`--profile`).
+- ✅ Reporting over attempt logs (`report`).
 
 Still left (next phases):
 - ⏳ Optional lightweight proxy mode (interceptor/wrapper behavior).
-- ⏳ Aggregate analytics/reporting command over JSONL history (summaries by peer/channel).
-- ⏳ Integration tests against a live Polar network.
+- ⏳ Concurrency mode for batch/multi-payment experiments.
+- ⏳ Streaming payment lifecycle tracking/fallback routing.
 
 ## Security notes
 

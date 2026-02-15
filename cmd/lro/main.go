@@ -39,10 +39,12 @@ func run(args []string) error {
 		return nil
 	case "health":
 		return runHealth(args[1:])
-	case "routes":
+	case "routes", "optimize":
 		return runRoutes(args[1:])
-	case "send-route":
+	case "send-route", "send":
 		return runSendRoute(args[1:])
+	case "report":
+		return runReport(args[1:])
 	default:
 		printUsage()
 		return fmt.Errorf("unknown command: %s", args[0])
@@ -54,11 +56,15 @@ func printUsage() {
 	fmt.Println(`Commands:
   health       Verify LND connectivity (GetInfo)
   routes       Query routes and rerank using custom scorer
+  optimize     Alias for routes (invoice-aware)
   send-route   Query+rerrank then attempt send via selected route
+  send         Alias for send-route (invoice-aware)
+  report       Summarize JSONL attempt logs
 
-Example:
-  lro routes --profile ./profile.json --dest <pubkey> --amt-sat 2000 --num-routes 5 --json
-  lro send-route --profile ./profile.json --dest <pubkey> --amt-sat 2000 --payment-hash <hashhex> --pick-rank 1 --dry-run`)
+Examples:
+  lro optimize --profile ./profile.json --invoice <bolt11> --num-routes 5 --json
+  lro send --profile ./profile.json --invoice <bolt11> --pick-rank 1 --dry-run
+  lro report --attempt-log .lro-attempts.jsonl --json`)
 }
 
 func runHealth(args []string) error {
@@ -91,28 +97,32 @@ func runHealth(args []string) error {
 func runRoutes(args []string) error {
 	var cfg config.LNDConfig
 	var (
-		profilePath string
-		dest        string
-		amtSat      int64
-		numRoutes   int
-		feeLimitSat int64
-		finalCLTV   int
-		failureLog  string
-		attemptLog  string
-		jsonOutput  bool
-		feeWeight   float64
-		failWeight  float64
-		probWeight  float64
+		profilePath       string
+		invoice           string
+		dest              string
+		amtSat            int64
+		numRoutes         int
+		feeLimitSat       int64
+		finalCLTV         int
+		failureLog        string
+		attemptLog        string
+		jsonOutput        bool
+		feeWeight         float64
+		failWeight        float64
+		probWeight        float64
+		avoidFailureHours int
 	)
 
 	fs := flag.NewFlagSet("routes", flag.ContinueOnError)
 	config.BindLNDFlags(fs, &cfg)
 	fs.StringVar(&profilePath, "profile", "", "Path to JSON profile for reproducible experiments")
+	fs.StringVar(&invoice, "invoice", "", "BOLT11 invoice (dest/amount auto-decoded)")
 	fs.StringVar(&dest, "dest", "", "Destination node pubkey (hex)")
 	fs.Int64Var(&amtSat, "amt-sat", 0, "Payment amount in satoshis")
 	fs.IntVar(&numRoutes, "num-routes", 10, "Maximum reranked routes to print")
 	fs.Int64Var(&feeLimitSat, "fee-limit-sat", 0, "Optional fee limit in satoshis")
 	fs.IntVar(&finalCLTV, "final-cltv", 40, "Final CLTV delta for QueryRoutes")
+	fs.IntVar(&avoidFailureHours, "avoid-failures-hours", 24, "Penalize only channels with failures in this recent window")
 	fs.StringVar(&failureLog, "failure-log", ".lro-failures.json", "Failure history JSON path")
 	fs.StringVar(&attemptLog, "attempt-log", ".lro-attempts.jsonl", "Structured attempt/output log path")
 	fs.BoolVar(&jsonOutput, "json", false, "Print scored routes as JSON")
@@ -128,17 +138,7 @@ func runRoutes(args []string) error {
 		return err
 	}
 	applyProfileToLNDConfig(profile, &cfg)
-	applyProfileToRoutes(profile, &numRoutes, &feeLimitSat, &failureLog, &attemptLog, &feeWeight, &failWeight, &probWeight, &finalCLTV)
-
-	if err := config.RequireNonEmpty("dest", dest); err != nil {
-		return err
-	}
-	if amtSat <= 0 {
-		return errors.New("amt-sat must be > 0")
-	}
-	if numRoutes <= 0 {
-		return errors.New("num-routes must be > 0")
-	}
+	applyProfileToRoutes(profile, &numRoutes, &feeLimitSat, &failureLog, &attemptLog, &feeWeight, &failWeight, &probWeight, &finalCLTV, &avoidFailureHours)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
@@ -149,6 +149,19 @@ func runRoutes(args []string) error {
 	}
 	defer client.Close()
 
+	dest, amtSat, _, err = populateFromInvoice(ctx, client, invoice, dest, amtSat, "")
+	if err != nil {
+		return err
+	}
+	if err := config.RequireNonEmpty("dest", dest); err != nil {
+		return err
+	}
+	if amtSat <= 0 {
+		return errors.New("amt-sat must be > 0 (or provide an invoice with amount)")
+	}
+	if numRoutes <= 0 {
+		return errors.New("num-routes must be > 0")
+	}
 	if _, err := hex.DecodeString(strings.TrimSpace(dest)); err != nil {
 		return fmt.Errorf("decode dest pubkey: %w", err)
 	}
@@ -175,9 +188,9 @@ func runRoutes(args []string) error {
 	if err != nil {
 		return err
 	}
-	weights := router.ScoreWeights{FeeWeight: feeWeight, FailureWeight: failWeight, ProbabilityWeight: probWeight}
+	weights := router.ScoreWeights{FeeWeight: feeWeight, FailureWeight: failWeight, ProbabilityWeight: probWeight, AvoidFailuresHours: avoidFailureHours}
 	scored := limitScores(router.ScoreRoutes(ctx, info.IdentityPubkey, client.Router, routesResp.Routes, history, amtSat*1000, weights), numRoutes)
-	_ = analytics.AppendJSONL(attemptLog, analytics.AttemptEvent{Command: "routes", Destination: dest, AmtSat: amtSat, Success: true, Meta: map[string]any{"returned": len(routesResp.Routes), "shown": len(scored)}})
+	_ = analytics.AppendJSONL(attemptLog, analytics.AttemptEvent{Command: "routes", Destination: dest, AmtSat: amtSat, Success: true, Meta: map[string]any{"returned": len(routesResp.Routes), "shown": len(scored), "invoice_mode": invoice != ""}})
 
 	if jsonOutput {
 		b, _ := json.MarshalIndent(scored, "", "  ")
@@ -195,24 +208,28 @@ func runRoutes(args []string) error {
 func runSendRoute(args []string) error {
 	var cfg config.LNDConfig
 	var (
-		profilePath string
-		dest        string
-		amtSat      int64
-		numRoutes   int
-		pickRank    int
-		paymentHash string
-		failureLog  string
-		attemptLog  string
-		dryRun      bool
+		profilePath       string
+		invoice           string
+		dest              string
+		amtSat            int64
+		numRoutes         int
+		pickRank          int
+		paymentHash       string
+		failureLog        string
+		attemptLog        string
+		dryRun            bool
+		avoidFailureHours int
 	)
 	fs := flag.NewFlagSet("send-route", flag.ContinueOnError)
 	config.BindLNDFlags(fs, &cfg)
 	fs.StringVar(&profilePath, "profile", "", "Path to JSON profile for reproducible experiments")
+	fs.StringVar(&invoice, "invoice", "", "BOLT11 invoice (dest/amount/hash auto-decoded)")
 	fs.StringVar(&dest, "dest", "", "Destination node pubkey (hex)")
 	fs.Int64Var(&amtSat, "amt-sat", 0, "Amount in satoshis")
 	fs.IntVar(&numRoutes, "num-routes", 10, "Maximum reranked routes considered")
 	fs.IntVar(&pickRank, "pick-rank", 1, "1-based reranked route index to attempt")
-	fs.StringVar(&paymentHash, "payment-hash", "", "32-byte payment hash hex")
+	fs.StringVar(&paymentHash, "payment-hash", "", "32-byte payment hash hex (optional if --invoice is provided)")
+	fs.IntVar(&avoidFailureHours, "avoid-failures-hours", 24, "Penalize only channels with failures in this recent window")
 	fs.StringVar(&failureLog, "failure-log", ".lro-failures.json", "Failure history JSON path")
 	fs.StringVar(&attemptLog, "attempt-log", ".lro-attempts.jsonl", "Structured attempt/output log path")
 	fs.BoolVar(&dryRun, "dry-run", false, "Do not send; only print selected route")
@@ -225,23 +242,7 @@ func runSendRoute(args []string) error {
 		return err
 	}
 	applyProfileToLNDConfig(profile, &cfg)
-	applyProfileToSend(profile, &numRoutes, &pickRank, &failureLog, &attemptLog)
-
-	if err := config.RequireNonEmpty("dest", dest); err != nil {
-		return err
-	}
-	if err := config.RequireNonEmpty("payment-hash", paymentHash); err != nil {
-		return err
-	}
-	if amtSat <= 0 {
-		return errors.New("amt-sat must be > 0")
-	}
-	if numRoutes <= 0 {
-		return errors.New("num-routes must be > 0")
-	}
-	if pickRank <= 0 {
-		return errors.New("pick-rank must be > 0")
-	}
+	applyProfileToSend(profile, &numRoutes, &pickRank, &failureLog, &attemptLog, &avoidFailureHours)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
@@ -251,6 +252,26 @@ func runSendRoute(args []string) error {
 		return err
 	}
 	defer client.Close()
+
+	dest, amtSat, paymentHash, err = populateFromInvoice(ctx, client, invoice, dest, amtSat, paymentHash)
+	if err != nil {
+		return err
+	}
+	if err := config.RequireNonEmpty("dest", dest); err != nil {
+		return err
+	}
+	if err := config.RequireNonEmpty("payment-hash", paymentHash); err != nil {
+		return err
+	}
+	if amtSat <= 0 {
+		return errors.New("amt-sat must be > 0 (or provide an invoice with amount)")
+	}
+	if numRoutes <= 0 {
+		return errors.New("num-routes must be > 0")
+	}
+	if pickRank <= 0 {
+		return errors.New("pick-rank must be > 0")
+	}
 
 	routesResp, err := client.LN.QueryRoutes(ctx, &lnrpc.QueryRoutesRequest{PubKey: dest, Amt: amtSat, UseMissionControl: true})
 	if err != nil {
@@ -269,7 +290,9 @@ func runSendRoute(args []string) error {
 	if err != nil {
 		return err
 	}
-	scored := limitScores(router.ScoreRoutes(ctx, info.IdentityPubkey, client.Router, routesResp.Routes, history, amtSat*1000, router.DefaultWeights()), numRoutes)
+	weights := router.DefaultWeights()
+	weights.AvoidFailuresHours = avoidFailureHours
+	scored := limitScores(router.ScoreRoutes(ctx, info.IdentityPubkey, client.Router, routesResp.Routes, history, amtSat*1000, weights), numRoutes)
 	if pickRank > len(scored) {
 		return fmt.Errorf("pick-rank=%d out of range; only %d scored routes available", pickRank, len(scored))
 	}
@@ -277,7 +300,7 @@ func runSendRoute(args []string) error {
 	selected := scored[pickRank-1]
 	fmt.Printf("selected route rank=%d score=%.2f fee_msat=%d hops=%d\n", pickRank, selected.Score, selected.TotalFeesMsat, selected.HopCount)
 	if dryRun {
-		_ = analytics.AppendJSONL(attemptLog, analytics.AttemptEvent{Command: "send-route", Destination: dest, AmtSat: amtSat, Selected: pickRank, DryRun: true, Success: true})
+		_ = analytics.AppendJSONL(attemptLog, analytics.AttemptEvent{Command: "send-route", Destination: dest, AmtSat: amtSat, Selected: pickRank, DryRun: true, Success: true, Meta: map[string]any{"invoice_mode": invoice != ""}})
 		fmt.Println("dry-run enabled: no payment was attempted")
 		return nil
 	}
@@ -304,8 +327,58 @@ func runSendRoute(args []string) error {
 		history = router.RegisterFailure(history, router.ExtractChannelIDs(selected.Route))
 	}
 	_ = router.SaveFailureHistory(failureLog, history)
-	_ = analytics.AppendJSONL(attemptLog, analytics.AttemptEvent{Command: "send-route", Destination: dest, AmtSat: amtSat, Selected: pickRank, Success: succeeded, Meta: map[string]any{"htlc_status": resp.Status.String(), "attempt_id": resp.AttemptId}})
+	_ = analytics.AppendJSONL(attemptLog, analytics.AttemptEvent{Command: "send-route", Destination: dest, AmtSat: amtSat, Selected: pickRank, Success: succeeded, Meta: map[string]any{"htlc_status": resp.Status.String(), "attempt_id": resp.AttemptId, "invoice_mode": invoice != ""}})
 	return nil
+}
+
+func runReport(args []string) error {
+	var attemptLog string
+	var asJSON bool
+	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	fs.StringVar(&attemptLog, "attempt-log", ".lro-attempts.jsonl", "Structured attempt/output log path")
+	fs.BoolVar(&asJSON, "json", false, "Print summary as JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	summary, err := analytics.SummarizeJSONL(attemptLog)
+	if err != nil {
+		return err
+	}
+	if asJSON {
+		b, _ := json.MarshalIndent(summary, "", "  ")
+		fmt.Println(string(b))
+		return nil
+	}
+
+	fmt.Printf("attempt log: %s\n", attemptLog)
+	fmt.Printf("total=%d success=%d failed=%d dry_runs=%d\n", summary.Total, summary.Succeeded, summary.Failed, summary.DryRuns)
+	fmt.Printf("commands=%v\n", summary.ByCommand)
+	fmt.Printf("top_destinations=%v\n", summary.ByDest)
+	if len(summary.ErrorCounts) > 0 {
+		fmt.Printf("errors=%v\n", summary.ErrorCounts)
+	}
+	return nil
+}
+
+func populateFromInvoice(ctx context.Context, client *lnd.Client, invoice, dest string, amtSat int64, paymentHash string) (string, int64, string, error) {
+	if strings.TrimSpace(invoice) == "" {
+		return dest, amtSat, paymentHash, nil
+	}
+	res, err := client.LN.DecodePayReq(ctx, &lnrpc.PayReqString{PayReq: invoice})
+	if err != nil {
+		return "", 0, "", fmt.Errorf("decode invoice: %w", err)
+	}
+	if dest == "" {
+		dest = res.Destination
+	}
+	if amtSat == 0 {
+		amtSat = res.NumSatoshis
+	}
+	if paymentHash == "" {
+		paymentHash = res.PaymentHash
+	}
+	return dest, amtSat, paymentHash, nil
 }
 
 func applyProfileToLNDConfig(p config.Profile, cfg *config.LNDConfig) {
@@ -323,7 +396,7 @@ func applyProfileToLNDConfig(p config.Profile, cfg *config.LNDConfig) {
 	}
 }
 
-func applyProfileToRoutes(p config.Profile, numRoutes *int, feeLimitSat *int64, failureLog, attemptLog *string, feeW, failW, probW *float64, finalCLTV *int) {
+func applyProfileToRoutes(p config.Profile, numRoutes *int, feeLimitSat *int64, failureLog, attemptLog *string, feeW, failW, probW *float64, finalCLTV *int, avoidFailuresHours *int) {
 	if p.NumRoutes > 0 {
 		*numRoutes = p.NumRoutes
 	}
@@ -348,9 +421,12 @@ func applyProfileToRoutes(p config.Profile, numRoutes *int, feeLimitSat *int64, 
 	if p.FinalCLTV > 0 {
 		*finalCLTV = int(p.FinalCLTV)
 	}
+	if p.AvoidFailuresHours > 0 {
+		*avoidFailuresHours = p.AvoidFailuresHours
+	}
 }
 
-func applyProfileToSend(p config.Profile, numRoutes, pickRank *int, failureLog, attemptLog *string) {
+func applyProfileToSend(p config.Profile, numRoutes, pickRank *int, failureLog, attemptLog *string, avoidFailuresHours *int) {
 	if p.NumRoutes > 0 {
 		*numRoutes = p.NumRoutes
 	}
@@ -362,6 +438,9 @@ func applyProfileToSend(p config.Profile, numRoutes, pickRank *int, failureLog, 
 	}
 	if p.AttemptLog != "" {
 		*attemptLog = p.AttemptLog
+	}
+	if p.AvoidFailuresHours > 0 {
+		*avoidFailuresHours = p.AvoidFailuresHours
 	}
 }
 

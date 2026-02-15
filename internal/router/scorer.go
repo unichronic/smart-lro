@@ -26,9 +26,10 @@ type RouteScore struct {
 }
 
 type ScoreWeights struct {
-	FeeWeight         float64
-	FailureWeight     float64
-	ProbabilityWeight float64
+	FeeWeight          float64
+	FailureWeight      float64
+	ProbabilityWeight  float64
+	AvoidFailuresHours int
 }
 
 type FailureRecord struct {
@@ -42,13 +43,13 @@ type FailureHistory struct {
 }
 
 func DefaultWeights() ScoreWeights {
-	return ScoreWeights{FeeWeight: 1.0, FailureWeight: 4000.0, ProbabilityWeight: 2000.0}
+	return ScoreWeights{FeeWeight: 1.0, FailureWeight: 4000.0, ProbabilityWeight: 2000.0, AvoidFailuresHours: 24}
 }
 
 func ScoreRoutes(ctx context.Context, sourcePubkey string, routerClient routerrpc.RouterClient, routes []*lnrpc.Route, failures FailureHistory, amtMsat int64, weights ScoreWeights) []RouteScore {
 	scored := make([]RouteScore, 0, len(routes))
 	for i, r := range routes {
-		failHits := failedHits(r, failures)
+		failHits := failedHits(r, failures, weights.AvoidFailuresHours)
 		avgProb := avgRouteProbability(ctx, sourcePubkey, routerClient, r, amtMsat)
 
 		feePenalty := float64(r.TotalFeesMsat) * weights.FeeWeight
@@ -126,12 +127,22 @@ func RegisterFailure(history FailureHistory, chanIDs []uint64) FailureHistory {
 	return history
 }
 
-func failedHits(route *lnrpc.Route, history FailureHistory) int {
+func failedHits(route *lnrpc.Route, history FailureHistory, avoidHours int) int {
 	hits := 0
+	var cutoff time.Time
+	if avoidHours > 0 {
+		cutoff = time.Now().UTC().Add(-time.Duration(avoidHours) * time.Hour)
+	}
+
 	for _, h := range route.Hops {
-		if rec, ok := history.Records[h.ChanId]; ok && rec.Count > 0 {
-			hits += rec.Count
+		rec, ok := history.Records[h.ChanId]
+		if !ok || rec.Count <= 0 {
+			continue
 		}
+		if !cutoff.IsZero() && rec.LastFailure.Before(cutoff) {
+			continue
+		}
+		hits += rec.Count
 	}
 	return hits
 }
