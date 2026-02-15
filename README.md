@@ -1,41 +1,25 @@
-# LRO (Lightning Routing Optimizer)
+# LRO - Lightning Routing Optimizer
 
-A standalone **experimental developer utility** for routing experiments on top of an existing LND node, now with invoice-aware optimize/send aliases, profile-driven runs, and JSONL attempt logging.
+**LRO** is an experimental routing optimization tool for the Lightning Network. It connects to an existing LND node, queries candidate payment routes, and applies custom scoring heuristics to select optimal paths based on fees, success probability, and channel reliability.
 
-## Scope
+## Features
 
-This tool is intentionally narrow:
-- ✅ Connects to an existing LND node over gRPC.
-- ✅ Fetches candidate routes (`QueryRoutes`).
-- ✅ Applies custom reranking heuristics (fees, mission control probability, local failure history).
-- ✅ Optionally attempts payment with selected route (`SendToRouteV2`).
+- **Smart Route Selection** - Reranks routes using configurable weights for fees, failure history, and mission control probability
+- **Invoice-Aware** - Decode BOLT11 invoices to automatically extract destination and amount
+- **Dry-Run Mode** - Test routing decisions without executing payments
+- **Batch Processing** - Process multiple invoices concurrently with worker pools
+- **Analytics** - JSONL logging and reporting for route performance analysis
+- **Profile-Driven** - Save credentials and preferences for reproducible experiments
 
-Not included:
-- ❌ Wallet features
-- ❌ Channel management
-- ❌ Full payment processor behavior
-- ❌ Running a Lightning node
+## Quick Start
 
-## Commands
-
-- `health` - check LND connectivity
-- `routes` - query/rerank candidate routes
-- `optimize` - alias of `routes` (invoice-friendly)
-- `send-route` - rerank and attempt payment over selected route
-- `send` - alias of `send-route` (invoice-friendly)
-- `batch-send` - process multiple invoices concurrently
-- `report` - summarize JSONL attempt logs
-
-## Build
+### Build
 
 ```bash
-go mod tidy
 go build ./cmd/lro
 ```
 
-## Usage
-
-### 1) Health check
+### Connect to LND
 
 ```bash
 ./lro health \
@@ -44,93 +28,100 @@ go build ./cmd/lro
   --macaroon ~/.lnd/data/chain/bitcoin/regtest/admin.macaroon
 ```
 
-### 2) Optimize routes from invoice (safe)
+### Find Best Route
 
 ```bash
 ./lro optimize \
-  --profile ./profile.json \
-  --invoice <bolt11> \
-  --num-routes 10 \
-  --avoid-failures-hours 24 \
-  --attempt-log .lro-attempts.jsonl \
+  --lnd-host localhost:10009 \
+  --tls-cert ~/.lnd/tls.cert \
+  --macaroon ~/.lnd/data/chain/bitcoin/regtest/admin.macaroon \
+  --invoice <BOLT11_INVOICE> \
   --json
 ```
 
-### 3) Send using optimized path (or dry-run)
+## Usage
 
-```bash
-./lro send \
-  --profile ./profile.json \
-  --invoice <bolt11> \
-  --pick-rank 1 \
-  --dry-run \
-  --failure-log .lro-failures.json \
-  --attempt-log .lro-attempts.jsonl
+### Profile Configuration (Recommended)
+
+Create `profile.json` to avoid repeating credentials:
+
+```json
+{
+  "lnd_host": "127.0.0.1:10009",
+  "tls_cert": "/path/to/tls.cert",
+  "macaroon": "/path/to/admin.macaroon",
+  "num_routes": 10,
+  "pick_rank": 1,
+  "avoid_failures_hours": 24
+}
 ```
 
-
-### 4) Batch send / batch dry-run (concurrent)
-
-Create `invoices.txt` with one BOLT11 invoice per line, then:
+Then use with:
 
 ```bash
-./lro batch-send \
-  --profile ./profile.json \
-  --invoices-file ./invoices.txt \
-  --workers 3 \
-  --dry-run \
-  --pick-rank 1 \
-  --attempt-log .lro-attempts.jsonl
+./lro optimize --profile ./profile.json --invoice <BOLT11> --json
 ```
 
-### 5) Attempt report
+### Commands
 
+| Command | Description |
+|---------|-------------|
+| `health` | Verify LND connectivity |
+| `optimize` | Query and rank routes for an invoice |
+| `send` | Execute payment using optimized route |
+| `batch-send` | Process multiple invoices concurrently |
+| `report` | Analyze attempt logs |
+
+### Examples
+
+**Test route selection (safe):**
+```bash
+./lro send --profile ./profile.json --invoice <BOLT11> --pick-rank 1 --dry-run
+```
+
+**Batch process invoices:**
+```bash
+# Create invoices.txt with one BOLT11 per line
+./lro batch-send --profile ./profile.json --invoices-file ./invoices.txt --workers 3 --dry-run
+```
+
+**View analytics:**
 ```bash
 ./lro report --attempt-log .lro-attempts.jsonl --json
 ```
 
-## Profile format (optional)
+## Development Setup
 
-```json
-{
-  "lnd_host": "localhost:10009",
-  "tls_cert": "/home/user/.lnd/tls.cert",
-  "macaroon": "/home/user/.lnd/data/chain/bitcoin/regtest/admin.macaroon",
-  "num_routes": 10,
-  "pick_rank": 1,
-  "w_fee": 1.0,
-  "w_fail": 4000.0,
-  "w_prob": 2000.0,
-  "avoid_failures_hours": 24,
-  "failure_log": ".lro-failures.json",
-  "attempt_log": ".lro-attempts.jsonl"
-}
-```
+For local testing, use [Polar](https://lightningpolar.com/) to create a regtest Lightning Network with LND nodes.
 
-CLI flags override profile values.
+1. Install and launch Polar
+2. Create a network with LND nodes
+3. Start the network and open channels
+4. Extract credentials from `~/.polar/networks/<id>/volumes/lnd/<node>/`
+5. Test LRO against your local node
 
-## Local dev recommendation
+## Configuration
 
-Use Polar for regtest experimentation and connect this CLI to one LND node.
+### Route Scoring Weights
 
-## Current status and what's left
+Customize route selection by adjusting weights in your profile:
 
-Implemented now:
-- ✅ LND connectivity health command.
-- ✅ Invoice-aware optimize/send flow (`--invoice`).
-- ✅ Route querying + reranking with custom weights and recent-failure window.
-- ✅ Optional route execution with rank selection (`--pick-rank`) and safe dry-run mode (`--dry-run`).
-- ✅ Local failure-history tracking to penalize unreliable channels over time.
-- ✅ Structured JSONL attempt logging for route/sending outcomes.
-- ✅ Reproducible profile-driven runs (`--profile`).
-- ✅ Reporting over attempt logs (`report`).
-- ✅ Concurrency mode for batch/multi-payment experiments (`batch-send`, worker pool).
+- `w_fee` (default: 1.0) - Penalty for higher fees
+- `w_fail` (default: 4000.0) - Penalty for channels with recent failures  
+- `w_prob` (default: 2000.0) - Boost for higher mission control probability
+- `avoid_failures_hours` (default: 24) - Only penalize recent failures
 
-Still left (next phases):
-- ⏳ Optional lightweight proxy mode (interceptor/wrapper behavior).
-- ⏳ Streaming payment lifecycle tracking/fallback routing.
+### Flags
 
-## Security notes
+All profile options can be overridden via CLI flags. Run `./lro <command> --help` for details.
 
-- Never commit TLS certs or macaroon files.
-- `--insecure-tls` is for development only.
+## Security
+
+⚠️ **Never commit credentials to version control**
+- Keep TLS certificates and macaroons private
+- Use `--insecure-tls` only for development
+- Store sensitive data outside the repository
+
+## License
+
+Experimental tool - use at your own risk.
