@@ -23,6 +23,7 @@ Not included:
 - `optimize` - alias of `routes` (invoice-friendly)
 - `send-route` - rerank and attempt payment over selected route
 - `send` - alias of `send-route` (invoice-friendly)
+- `batch-send` - process multiple invoices concurrently
 - `report` - summarize JSONL attempt logs
 
 ## Build
@@ -67,7 +68,22 @@ go build ./cmd/lro
   --attempt-log .lro-attempts.jsonl
 ```
 
-### 4) Attempt report
+
+### 4) Batch send / batch dry-run (concurrent)
+
+Create `invoices.txt` with one BOLT11 invoice per line, then:
+
+```bash
+./lro batch-send \
+  --profile ./profile.json \
+  --invoices-file ./invoices.txt \
+  --workers 3 \
+  --dry-run \
+  --pick-rank 1 \
+  --attempt-log .lro-attempts.jsonl
+```
+
+### 5) Attempt report
 
 ```bash
 ./lro report --attempt-log .lro-attempts.jsonl --json
@@ -108,10 +124,10 @@ Implemented now:
 - ✅ Structured JSONL attempt logging for route/sending outcomes.
 - ✅ Reproducible profile-driven runs (`--profile`).
 - ✅ Reporting over attempt logs (`report`).
+- ✅ Concurrency mode for batch/multi-payment experiments (`batch-send`, worker pool).
 
 Still left (next phases):
 - ⏳ Optional lightweight proxy mode (interceptor/wrapper behavior).
-- ⏳ Concurrency mode for batch/multi-payment experiments.
 - ⏳ Streaming payment lifecycle tracking/fallback routing.
 
 ## Security notes

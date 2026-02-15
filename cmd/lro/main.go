@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,8 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/example/lro/internal/analytics"
@@ -43,6 +46,8 @@ func run(args []string) error {
 		return runRoutes(args[1:])
 	case "send-route", "send":
 		return runSendRoute(args[1:])
+	case "batch-send":
+		return runBatchSend(args[1:])
 	case "report":
 		return runReport(args[1:])
 	default:
@@ -59,11 +64,13 @@ func printUsage() {
   optimize     Alias for routes (invoice-aware)
   send-route   Query+rerrank then attempt send via selected route
   send         Alias for send-route (invoice-aware)
+  batch-send   Process multiple invoices concurrently
   report       Summarize JSONL attempt logs
 
 Examples:
   lro optimize --profile ./profile.json --invoice <bolt11> --num-routes 5 --json
   lro send --profile ./profile.json --invoice <bolt11> --pick-rank 1 --dry-run
+  lro batch-send --profile ./profile.json --invoices-file ./invoices.txt --workers 3 --dry-run
   lro report --attempt-log .lro-attempts.jsonl --json`)
 }
 
@@ -257,77 +264,152 @@ func runSendRoute(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := config.RequireNonEmpty("dest", dest); err != nil {
-		return err
-	}
-	if err := config.RequireNonEmpty("payment-hash", paymentHash); err != nil {
-		return err
-	}
-	if amtSat <= 0 {
-		return errors.New("amt-sat must be > 0 (or provide an invoice with amount)")
-	}
-	if numRoutes <= 0 {
-		return errors.New("num-routes must be > 0")
-	}
-	if pickRank <= 0 {
-		return errors.New("pick-rank must be > 0")
-	}
-
-	routesResp, err := client.LN.QueryRoutes(ctx, &lnrpc.QueryRoutesRequest{PubKey: dest, Amt: amtSat, UseMissionControl: true})
-	if err != nil {
-		_ = analytics.AppendJSONL(attemptLog, analytics.AttemptEvent{Command: "send-route", Destination: dest, AmtSat: amtSat, Selected: pickRank, DryRun: dryRun, Success: false, Error: err.Error()})
-		return err
-	}
-	if len(routesResp.Routes) == 0 {
-		return errors.New("no route candidates returned")
-	}
 
 	history, err := router.LoadFailureHistory(failureLog)
 	if err != nil {
 		return err
 	}
-	info, err := client.LN.GetInfo(ctx, &lnrpc.GetInfoRequest{})
+	historyMu := &sync.Mutex{}
+
+	res, err := executeSend(ctx, client, historyMu, &history, sendInput{
+		invoice:           invoice,
+		dest:              dest,
+		amtSat:            amtSat,
+		numRoutes:         numRoutes,
+		pickRank:          pickRank,
+		paymentHash:       paymentHash,
+		failureLog:        failureLog,
+		attemptLog:        attemptLog,
+		dryRun:            dryRun,
+		avoidFailureHours: avoidFailureHours,
+	})
 	if err != nil {
 		return err
 	}
-	weights := router.DefaultWeights()
-	weights.AvoidFailuresHours = avoidFailureHours
-	scored := limitScores(router.ScoreRoutes(ctx, info.IdentityPubkey, client.Router, routesResp.Routes, history, amtSat*1000, weights), numRoutes)
-	if pickRank > len(scored) {
-		return fmt.Errorf("pick-rank=%d out of range; only %d scored routes available", pickRank, len(scored))
+	if res != nil {
+		fmt.Printf("selected route rank=%d score=%.2f fee_msat=%d hops=%d\n", res.SelectedRank, res.Score, res.FeeMsat, res.Hops)
+		if res.DryRun {
+			fmt.Println("dry-run enabled: no payment was attempted")
+		} else {
+			fmt.Printf("status=%s htlc_attempt_id=%d\n", res.Status, res.AttemptID)
+		}
+	}
+	return nil
+}
+
+func runBatchSend(args []string) error {
+	var cfg config.LNDConfig
+	var (
+		profilePath       string
+		invoicesFile      string
+		workers           int
+		numRoutes         int
+		pickRank          int
+		failureLog        string
+		attemptLog        string
+		dryRun            bool
+		avoidFailureHours int
+	)
+
+	fs := flag.NewFlagSet("batch-send", flag.ContinueOnError)
+	config.BindLNDFlags(fs, &cfg)
+	fs.StringVar(&profilePath, "profile", "", "Path to JSON profile for reproducible experiments")
+	fs.StringVar(&invoicesFile, "invoices-file", "", "Path to newline-delimited BOLT11 invoices")
+	fs.IntVar(&workers, "workers", 2, "Number of concurrent workers")
+	fs.IntVar(&numRoutes, "num-routes", 10, "Maximum reranked routes considered")
+	fs.IntVar(&pickRank, "pick-rank", 1, "1-based reranked route index to attempt")
+	fs.IntVar(&avoidFailureHours, "avoid-failures-hours", 24, "Penalize only channels with failures in this recent window")
+	fs.StringVar(&failureLog, "failure-log", ".lro-failures.json", "Failure history JSON path")
+	fs.StringVar(&attemptLog, "attempt-log", ".lro-attempts.jsonl", "Structured attempt/output log path")
+	fs.BoolVar(&dryRun, "dry-run", true, "Do not send; only score/select route per invoice")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
 
-	selected := scored[pickRank-1]
-	fmt.Printf("selected route rank=%d score=%.2f fee_msat=%d hops=%d\n", pickRank, selected.Score, selected.TotalFeesMsat, selected.HopCount)
-	if dryRun {
-		_ = analytics.AppendJSONL(attemptLog, analytics.AttemptEvent{Command: "send-route", Destination: dest, AmtSat: amtSat, Selected: pickRank, DryRun: true, Success: true, Meta: map[string]any{"invoice_mode": invoice != ""}})
-		fmt.Println("dry-run enabled: no payment was attempted")
-		return nil
+	if invoicesFile == "" {
+		return errors.New("invoices-file is required")
+	}
+	if workers <= 0 {
+		return errors.New("workers must be > 0")
 	}
 
-	hashBytes, err := hex.DecodeString(strings.TrimSpace(paymentHash))
+	profile, err := config.LoadProfile(profilePath)
 	if err != nil {
 		return err
 	}
-	if len(hashBytes) != 32 {
-		return fmt.Errorf("payment hash must be 32 bytes, got %d", len(hashBytes))
-	}
+	applyProfileToLNDConfig(profile, &cfg)
+	applyProfileToSend(profile, &numRoutes, &pickRank, &failureLog, &attemptLog, &avoidFailureHours)
 
-	resp, err := client.Router.SendToRouteV2(ctx, &routerrpc.SendToRouteRequest{PaymentHash: hashBytes, Route: selected.Route, SkipTempErr: true})
+	invoices, err := loadInvoicesFile(invoicesFile)
 	if err != nil {
-		history = router.RegisterFailure(history, router.ExtractChannelIDs(selected.Route))
-		_ = router.SaveFailureHistory(failureLog, history)
-		_ = analytics.AppendJSONL(attemptLog, analytics.AttemptEvent{Command: "send-route", Destination: dest, AmtSat: amtSat, Selected: pickRank, Success: false, Error: err.Error()})
-		return fmt.Errorf("send to route failed: %w", err)
+		return err
+	}
+	if len(invoices) == 0 {
+		return errors.New("no invoices found in invoices-file")
 	}
 
-	succeeded := resp.Status == lnrpc.HTLCAttempt_SUCCEEDED
-	fmt.Printf("status=%v preimage=%x htlc_attempt_id=%d\n", resp.Status, resp.Preimage, resp.AttemptId)
-	if !succeeded {
-		history = router.RegisterFailure(history, router.ExtractChannelIDs(selected.Route))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	client, err := lnd.New(ctx, cfg)
+	if err != nil {
+		return err
 	}
-	_ = router.SaveFailureHistory(failureLog, history)
-	_ = analytics.AppendJSONL(attemptLog, analytics.AttemptEvent{Command: "send-route", Destination: dest, AmtSat: amtSat, Selected: pickRank, Success: succeeded, Meta: map[string]any{"htlc_status": resp.Status.String(), "attempt_id": resp.AttemptId, "invoice_mode": invoice != ""}})
+	defer client.Close()
+
+	history, err := router.LoadFailureHistory(failureLog)
+	if err != nil {
+		return err
+	}
+	historyMu := &sync.Mutex{}
+
+	jobs := make(chan string)
+	var okCount int64
+	var failCount int64
+	var wg sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for inv := range jobs {
+				itemCtx, itemCancel := context.WithTimeout(context.Background(), 45*time.Second)
+				_, err := executeSend(itemCtx, client, historyMu, &history, sendInput{
+					invoice:           inv,
+					numRoutes:         numRoutes,
+					pickRank:          pickRank,
+					failureLog:        failureLog,
+					attemptLog:        attemptLog,
+					dryRun:            dryRun,
+					avoidFailureHours: avoidFailureHours,
+				})
+				itemCancel()
+				if err != nil {
+					atomic.AddInt64(&failCount, 1)
+					fmt.Printf("worker=%d invoice_failed err=%v\n", workerID, err)
+					continue
+				}
+				atomic.AddInt64(&okCount, 1)
+			}
+		}(i + 1)
+	}
+
+	for _, inv := range invoices {
+		jobs <- inv
+	}
+	close(jobs)
+	wg.Wait()
+
+	historyMu.Lock()
+	saveErr := router.SaveFailureHistory(failureLog, history)
+	historyMu.Unlock()
+	if saveErr != nil {
+		return saveErr
+	}
+
+	fmt.Printf("batch completed total=%d success=%d failed=%d dry_run=%v\n", len(invoices), okCount, failCount, dryRun)
+	if failCount > 0 {
+		return fmt.Errorf("%d invoice(s) failed", failCount)
+	}
 	return nil
 }
 
@@ -359,6 +441,132 @@ func runReport(args []string) error {
 		fmt.Printf("errors=%v\n", summary.ErrorCounts)
 	}
 	return nil
+}
+
+type sendInput struct {
+	invoice           string
+	dest              string
+	amtSat            int64
+	numRoutes         int
+	pickRank          int
+	paymentHash       string
+	failureLog        string
+	attemptLog        string
+	dryRun            bool
+	avoidFailureHours int
+}
+
+type sendResult struct {
+	SelectedRank int
+	Score        float64
+	FeeMsat      int64
+	Hops         int
+	DryRun       bool
+	Status       string
+	AttemptID    uint64
+}
+
+func executeSend(ctx context.Context, client *lnd.Client, historyMu *sync.Mutex, history *router.FailureHistory, in sendInput) (*sendResult, error) {
+	dest, amtSat, paymentHash, err := populateFromInvoice(ctx, client, in.invoice, in.dest, in.amtSat, in.paymentHash)
+	if err != nil {
+		return nil, err
+	}
+	if err := config.RequireNonEmpty("dest", dest); err != nil {
+		return nil, err
+	}
+	if err := config.RequireNonEmpty("payment-hash", paymentHash); err != nil {
+		return nil, err
+	}
+	if amtSat <= 0 {
+		return nil, errors.New("amt-sat must be > 0 (or provide an invoice with amount)")
+	}
+	if in.numRoutes <= 0 {
+		return nil, errors.New("num-routes must be > 0")
+	}
+	if in.pickRank <= 0 {
+		return nil, errors.New("pick-rank must be > 0")
+	}
+
+	routesResp, err := client.LN.QueryRoutes(ctx, &lnrpc.QueryRoutesRequest{PubKey: dest, Amt: amtSat, UseMissionControl: true})
+	if err != nil {
+		_ = analytics.AppendJSONL(in.attemptLog, analytics.AttemptEvent{Command: "send-route", Destination: dest, AmtSat: amtSat, Selected: in.pickRank, DryRun: in.dryRun, Success: false, Error: err.Error()})
+		return nil, err
+	}
+	if len(routesResp.Routes) == 0 {
+		return nil, errors.New("no route candidates returned")
+	}
+
+	info, err := client.LN.GetInfo(ctx, &lnrpc.GetInfoRequest{})
+	if err != nil {
+		return nil, err
+	}
+
+	historyMu.Lock()
+	localHistory := *history
+	historyMu.Unlock()
+
+	weights := router.DefaultWeights()
+	weights.AvoidFailuresHours = in.avoidFailureHours
+	scored := limitScores(router.ScoreRoutes(ctx, info.IdentityPubkey, client.Router, routesResp.Routes, localHistory, amtSat*1000, weights), in.numRoutes)
+	if in.pickRank > len(scored) {
+		return nil, fmt.Errorf("pick-rank=%d out of range; only %d scored routes available", in.pickRank, len(scored))
+	}
+
+	selected := scored[in.pickRank-1]
+	if in.dryRun {
+		_ = analytics.AppendJSONL(in.attemptLog, analytics.AttemptEvent{Command: "send-route", Destination: dest, AmtSat: amtSat, Selected: in.pickRank, DryRun: true, Success: true, Meta: map[string]any{"invoice_mode": in.invoice != ""}})
+		return &sendResult{SelectedRank: in.pickRank, Score: selected.Score, FeeMsat: selected.TotalFeesMsat, Hops: selected.HopCount, DryRun: true}, nil
+	}
+
+	hashBytes, err := hex.DecodeString(strings.TrimSpace(paymentHash))
+	if err != nil {
+		return nil, err
+	}
+	if len(hashBytes) != 32 {
+		return nil, fmt.Errorf("payment hash must be 32 bytes, got %d", len(hashBytes))
+	}
+
+	resp, err := client.Router.SendToRouteV2(ctx, &routerrpc.SendToRouteRequest{PaymentHash: hashBytes, Route: selected.Route, SkipTempErr: true})
+	if err != nil {
+		historyMu.Lock()
+		*history = router.RegisterFailure(*history, router.ExtractChannelIDs(selected.Route))
+		_ = router.SaveFailureHistory(in.failureLog, *history)
+		historyMu.Unlock()
+		_ = analytics.AppendJSONL(in.attemptLog, analytics.AttemptEvent{Command: "send-route", Destination: dest, AmtSat: amtSat, Selected: in.pickRank, Success: false, Error: err.Error()})
+		return nil, fmt.Errorf("send to route failed: %w", err)
+	}
+
+	succeeded := resp.Status == lnrpc.HTLCAttempt_SUCCEEDED
+	if !succeeded {
+		historyMu.Lock()
+		*history = router.RegisterFailure(*history, router.ExtractChannelIDs(selected.Route))
+		_ = router.SaveFailureHistory(in.failureLog, *history)
+		historyMu.Unlock()
+	}
+	_ = analytics.AppendJSONL(in.attemptLog, analytics.AttemptEvent{Command: "send-route", Destination: dest, AmtSat: amtSat, Selected: in.pickRank, Success: succeeded, Meta: map[string]any{"htlc_status": resp.Status.String(), "attempt_id": resp.AttemptId, "invoice_mode": in.invoice != ""}})
+	return &sendResult{SelectedRank: in.pickRank, Score: selected.Score, FeeMsat: selected.TotalFeesMsat, Hops: selected.HopCount, DryRun: false, Status: resp.Status.String(), AttemptID: resp.AttemptId}, nil
+}
+
+func loadInvoicesFile(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var out []string
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		out = append(out, line)
+	}
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func populateFromInvoice(ctx context.Context, client *lnd.Client, invoice, dest string, amtSat int64, paymentHash string) (string, int64, string, error) {
