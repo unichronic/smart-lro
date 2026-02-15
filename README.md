@@ -1,6 +1,6 @@
 # LRO (Lightning Routing Optimizer)
 
-A standalone **experimental developer utility** for routing experiments on top of an existing LND node.
+A standalone **experimental developer utility** for routing experiments on top of an existing LND node, now with profile-driven runs and JSONL attempt logging.
 
 ## Scope
 
@@ -47,10 +47,12 @@ go build ./cmd/lro
 
 ```bash
 ./lro routes \
+  --profile ./profile.json \
   --dest <33-byte-node-pubkey-hex> \
   --amt-sat 5000 \
   --num-routes 10 \
-  --failure-log .lro-failures.json
+  --failure-log .lro-failures.json \
+  --attempt-log .lro-attempts.jsonl
 ```
 
 Optional scoring weights:
@@ -68,11 +70,37 @@ JSON output mode:
 
 ```bash
 ./lro send-route \
+  --profile ./profile.json \
   --dest <pubkeyhex> \
   --amt-sat 5000 \
   --payment-hash <32-byte-hash-hex> \
-  --failure-log .lro-failures.json
+  --pick-rank 1 \
+  --dry-run \
+  --failure-log .lro-failures.json \
+  --attempt-log .lro-attempts.jsonl
 ```
+
+
+### Profile format (optional)
+
+You can store repeatable experiment defaults in JSON:
+
+```json
+{
+  "lnd_host": "localhost:10009",
+  "tls_cert": "/home/user/.lnd/tls.cert",
+  "macaroon": "/home/user/.lnd/data/chain/bitcoin/regtest/admin.macaroon",
+  "num_routes": 10,
+  "pick_rank": 1,
+  "w_fee": 1.0,
+  "w_fail": 4000.0,
+  "w_prob": 2000.0,
+  "failure_log": ".lro-failures.json",
+  "attempt_log": ".lro-attempts.jsonl"
+}
+```
+
+CLI flags still work and can override profile values as needed.
 
 ## Local dev recommendation
 
@@ -86,11 +114,12 @@ Implemented now:
 - ✅ Route querying + reranking with custom weights.
 - ✅ Optional route execution with rank selection (`--pick-rank`) and safe dry-run mode (`--dry-run`).
 - ✅ Local failure-history tracking to penalize unreliable channels over time.
+- ✅ Structured JSONL attempt logging for route/sending outcomes.
+- ✅ Reproducible profile-driven runs (`--profile`).
 
 Still left (next phases):
 - ⏳ Optional lightweight proxy mode (interceptor/wrapper behavior).
-- ⏳ Better persistence/analytics (attempt logs, route outcomes, aggregate stats).
-- ⏳ Config profiles and richer output formats for experiment reproducibility.
+- ⏳ Aggregate analytics/reporting command over JSONL history (summaries by peer/channel).
 - ⏳ Integration tests against a live Polar network.
 
 ## Security notes
